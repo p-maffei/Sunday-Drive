@@ -32,6 +32,12 @@ segments).
 | API | FastAPI + psycopg3, deployed on Replit |
 | App | Expo / React Native, MapLibre, OpenFreeMap basemap, Geoapify geocoding |
 
+## Repository layout
+
+    pipeline/   three Colab-ready scripts: download and stage, score and check, swap and rollback
+    sql/        the routing functions (plan_via, wander_candidates)
+    api/        the FastAPI service (main.py)
+
 ## Scoring
 
 Every road segment (edge) has scores from 0 to 1:
