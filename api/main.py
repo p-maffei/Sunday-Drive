@@ -1,15 +1,23 @@
 import os
 import json
+import threading
+import time
+from collections import defaultdict, deque
+
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Sunday Drive API")
 
-# Lets your UI (on a different URL) call this API. Tighten later.
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"])
+# Browsers may only call this API from the origins listed in the ALLOWED_ORIGINS
+# secret (comma-separated, e.g. https://my-app.replit.app). Empty = no browser
+# origins allowed. Native apps, curl and Colab are not affected by CORS.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",")
+                   if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+                   allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 
 # Only these names are ever allowed into SQL (column names can't be parameterized)
 PREF_COLUMNS = ["curvy", "backroads", "urban"]
@@ -29,6 +37,52 @@ MAX_OPTIONS = 3
 # Row layout used by the helpers below:
 # (length_m, curvy, backroads, urban, geojson_text, time_s)
 SCORE_IDX = {"curvy": 1, "backroads": 2, "urban": 3}
+
+
+# --- Abuse protection ---
+# Per-visitor request limits (in memory, per server instance) plus a cap on how many
+# /wander searches may run at once, because each one is heavy on the database.
+MAX_CONCURRENT_WANDER = 3
+_wander_slots = threading.BoundedSemaphore(MAX_CONCURRENT_WANDER)
+_hits = defaultdict(deque)
+_hits_lock = threading.Lock()
+
+
+# Number of proxy hops between the caller and this app that append to X-Forwarded-For.
+# On Replit's deployment the header looks like: client, load balancer, two more hops,
+# so the real caller sits 4th from the right. Entries to its left were typed by the
+# caller and cannot be trusted. Check with GET /whoami if Replit's setup ever changes.
+TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "3"))
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        parts = [p.strip() for p in fwd.split(",")]
+        if len(parts) > TRUSTED_PROXY_HOPS:
+            return parts[-(TRUSTED_PROXY_HOPS + 1)]
+        return parts[-1]
+    return request.client.host if request.client else "unknown"
+
+
+def rate_limit(bucket: str, max_calls: int, window_s: int):
+    def check(request: Request):
+        key = (bucket, client_ip(request))
+        now = time.monotonic()
+        with _hits_lock:
+            q = _hits[key]
+            while q and now - q[0] > window_s:
+                q.popleft()
+            if len(q) >= max_calls:
+                retry = int(window_s - (now - q[0])) + 1
+                raise HTTPException(
+                    429, "Too many requests. Please slow down.",
+                    headers={"Retry-After": str(retry)})
+            q.append(now)
+            if len(_hits) > 10000:   # forget visitors who have gone quiet
+                for k in [k for k, v in _hits.items() if not v or now - v[-1] > 3600]:
+                    del _hits[k]
+    return check
 
 
 class RouteRequest(BaseModel):
@@ -146,7 +200,7 @@ def health():
     return {"ok": True}
 
 
-@app.post("/route")
+@app.post("/route", dependencies=[Depends(rate_limit("route", 10, 60))])
 def route(req: RouteRequest):
     # 1. Reject points outside the area you loaded
     check_bbox(req.start, req.end)
@@ -186,7 +240,7 @@ def route(req: RouteRequest):
     return out
 
 
-@app.post("/fastest")
+@app.post("/fastest", dependencies=[Depends(rate_limit("fastest", 30, 60))])
 def fastest(req: FastestRequest):
     check_bbox(req.start, req.end)
     with get_conn() as conn, conn.cursor() as cur:
@@ -204,8 +258,19 @@ def fastest(req: FastestRequest):
     }
 
 
-@app.post("/wander")
+@app.post("/wander", dependencies=[Depends(rate_limit("wander", 6, 60)),
+                                   Depends(rate_limit("wander-hour", 60, 3600))])
 def wander(req: WanderRequest):
+    if not _wander_slots.acquire(blocking=False):
+        raise HTTPException(503, "The route finder is busy. Try again in a moment.",
+                            headers={"Retry-After": "10"})
+    try:
+        return _wander(req)
+    finally:
+        _wander_slots.release()
+
+
+def _wander(req: WanderRequest):
     check_bbox(req.start, req.end)
     selected = clean_prefs(req.preferences)
     wandering = req.extra_min > 0
